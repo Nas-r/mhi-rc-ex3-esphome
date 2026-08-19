@@ -56,11 +56,20 @@ time:
     id: ha_time
 
 # ── External component (fetched from GitHub at compile time) ─────────────────
+#
+# `ref` MUST be a full commit SHA, never a branch name. ESPHome caches the
+# clone under a key of url@ref and, on refresh, runs `git stash` + `git reset
+# --hard` — so a branch ref means a rebuild silently picks up whatever that
+# branch has become, while a SHA rebuilds byte-identically forever.
+#
+# The build fetches this repository from GitHub; it does not read the local
+# components/ directory. Local edits have no effect on the device until they
+# are committed, pushed, and this ref is bumped to the new commit.
 external_components:
   - source:
       type: git
-      url: https://github.com/hump-coder/mhi-rc-ex3-esphome.git
-      ref: b1a6b9e6b662ba86f17ab485ea2acee2b8020051
+      url: https://github.com/Nas-r/mhi-rc-ex3-esphome.git
+      ref: 3b4feb0b1bfd3c0c08a85583b5bc33fb5220b2fd
     refresh: 0s
     components: [rc_ex3]
 
