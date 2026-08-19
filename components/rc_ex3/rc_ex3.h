@@ -136,6 +136,10 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   static const uint32_t OP_DATA_HANDSHAKE_MS   = 15000;
   static const uint16_t MAX_OP_DATA_EXCHANGES  = 600;
 
+  // True only between sending an op-data request and the exchange finishing.
+  // Without it the RSR2 responder is live even when op_data_interval is 0, so
+  // an unsolicited RSR2 from the panel starts a handshake nobody asked for.
+  bool     op_data_active_{false};
   uint32_t op_data_started_ms_{0};
   uint16_t op_data_exchanges_{0};
 
