@@ -89,7 +89,11 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
 
   // How long the requested state stays authoritative after a frame goes out,
   // and how many times to re-send before believing the panel instead.
-  static const uint32_t COMMAND_SETTLE_MS    = 3000;
+  // The panel can take tens of seconds to adopt a change and report it back.
+  // Giving up sooner than that republishes its stale value, which is exactly
+  // the "I changed it and it snapped back" symptom — the request has to stay
+  // authoritative for longer than the panel's worst observed adoption time.
+  static const uint32_t COMMAND_SETTLE_MS    = 5000;
   static const uint8_t  MAX_COMMAND_RETRIES  = 2;
 
   bool     command_pending_{false};
@@ -101,7 +105,7 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   // update_interval away. Waiting for that would expire the settle window on
   // every command, so a status request is issued to confirm actively.
   static const uint32_t CONFIRM_POLL_DELAY_MS = 600;
-  static const uint8_t  MAX_CONFIRM_POLLS     = 3;
+  static const uint8_t  MAX_CONFIRM_POLLS     = 10;   // ~50 s of patience
 
   bool     awaiting_confirmation_{false};
   uint32_t command_sent_ms_{0};
