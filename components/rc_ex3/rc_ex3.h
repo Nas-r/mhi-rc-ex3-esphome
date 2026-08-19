@@ -54,6 +54,7 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   void parse_operational_data(const char *buf, size_t len);
 
   void apply_wire_fan_mode(char wire_c);
+  bool status_matches_desired(char pwr_c, char mode_c, char fan_c, unsigned int raw_temp) const;
 
   uint8_t calc_checksum(const char *data, size_t len);
   size_t  hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
@@ -68,6 +69,16 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   size_t  rx_len_{0};
   RxState rx_state_{RxState::WAITING_FOR_SOF};
 
+  // Cap bytes drained per loop() call. `while (available())` is unbounded, so a
+  // continuously talking or noisy bus would starve the main loop and stall the
+  // API. Anything left over is picked up on the next tick.
+  static const size_t MAX_RX_BYTES_PER_LOOP = 256;
+
+  // The setpoint range advertised to Home Assistant, and the band a status
+  // response must fall inside to be believed.
+  static constexpr float MIN_SETPOINT_C = 16.0f;
+  static constexpr float MAX_SETPOINT_C = 30.0f;
+
   // Home Assistant sends one control call per field, and dragging the
   // temperature slider sends one per step. The panel silently drops frames
   // that arrive faster than it can process them, so calls are coalesced into
@@ -76,9 +87,18 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   static const uint32_t COMMAND_DEBOUNCE_MS = 400;
   static const uint32_t MIN_TX_GAP_MS       = 150;
 
+  // How long the requested state stays authoritative after a frame goes out,
+  // and how many times to re-send before believing the panel instead.
+  static const uint32_t COMMAND_SETTLE_MS    = 3000;
+  static const uint8_t  MAX_COMMAND_RETRIES  = 2;
+
   bool     command_pending_{false};
   uint32_t command_dirty_ms_{0};
   uint32_t last_tx_ms_{0};
+
+  bool     awaiting_confirmation_{false};
+  uint32_t command_sent_ms_{0};
+  uint8_t  command_retries_{0};
 
   // What Home Assistant actually asked for, encoded at control() time. A status
   // response arriving during the debounce window rewrites the entity fields, so
@@ -88,6 +108,17 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   uint8_t desired_mode_wire_{0};
   uint8_t desired_fan_wire_{0x07};
   uint8_t desired_temp_wire_{44};
+
+  // The unit answers an op-data request with RSR2 ("not ready") until it is
+  // willing to send the blob. Upstream sleeps 500 ms between attempts; this
+  // component paces them from loop() instead, and gives up after a bounded
+  // number so a sulking unit cannot occupy the bus indefinitely.
+  static const uint32_t OP_DATA_RETRY_MS    = 500;
+  static const uint8_t  MAX_OP_DATA_RETRIES = 10;
+
+  bool     op_data_page2_pending_{false};
+  uint32_t op_data_last_attempt_ms_{0};
+  uint8_t  op_data_retries_{0};
 
   uint32_t op_data_interval_minutes_{0};
   uint32_t last_op_data_ms_{0};

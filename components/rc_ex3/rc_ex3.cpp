@@ -20,8 +20,8 @@ climate::ClimateTraits RcEx3Climate::traits() {
     climate::CLIMATE_MODE_FAN_ONLY,
   });
   traits.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO});
-  traits.set_visual_min_temperature(16.0f);
-  traits.set_visual_max_temperature(30.0f);
+  traits.set_visual_min_temperature(MIN_SETPOINT_C);
+  traits.set_visual_max_temperature(MAX_SETPOINT_C);
   traits.set_visual_temperature_step(0.5f);
   return traits;
 }
@@ -51,7 +51,8 @@ void RcEx3Climate::update() {
 // ─── Serial RX loop ──────────────────────────────────────────────────────────
 
 void RcEx3Climate::loop() {
-  while (this->available()) {
+  size_t budget = MAX_RX_BYTES_PER_LOOP;
+  while (budget-- > 0 && this->available()) {
     uint8_t c;
     if (!this->read_byte(&c))
       break;
@@ -85,8 +86,29 @@ void RcEx3Climate::loop() {
   // Send the op_data request once the status response has been received,
   // separated from the previous frame to avoid overlapping Tx.
   if (op_data_pending_ && (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
-    op_data_pending_ = false;
+    op_data_pending_         = false;
+    op_data_retries_         = 0;
+    op_data_last_attempt_ms_ = now;
     send_operational_data_request(false);
+    return;
+  }
+
+  // Paced continuation of the RSR2 "not ready" handshake.
+  if (op_data_page2_pending_ && (now - op_data_last_attempt_ms_) >= OP_DATA_RETRY_MS &&
+      (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
+    op_data_page2_pending_ = false;
+    if (op_data_retries_ < MAX_OP_DATA_RETRIES) {
+      op_data_retries_++;
+      op_data_last_attempt_ms_ = now;
+      send_operational_data_request(true);
+    } else {
+      // Stop asking, and start the interval now so a unit that is never ready
+      // does not get re-asked on every poll for the rest of time.
+      ESP_LOGW(TAG, "unit still not ready for op-data after %u attempts; skipping this cycle",
+               MAX_OP_DATA_RETRIES);
+      op_data_retries_ = 0;
+      last_op_data_ms_ = now;
+    }
     return;
   }
 
@@ -96,6 +118,27 @@ void RcEx3Climate::loop() {
       (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
     command_pending_ = false;
     send_pending_command();
+    return;
+  }
+
+  // The panel normally reports the new state within milliseconds. If it has
+  // not adopted it by the end of the settle window the frame was dropped, so
+  // re-send rather than silently leaving Home Assistant showing a request the
+  // unit never applied.
+  if (awaiting_confirmation_ && (now - command_sent_ms_) >= COMMAND_SETTLE_MS) {
+    if (command_retries_ < MAX_COMMAND_RETRIES) {
+      if ((now - last_tx_ms_) >= MIN_TX_GAP_MS) {
+        command_retries_++;
+        ESP_LOGW(TAG, "panel has not adopted the requested state; re-sending (%u/%u)",
+                 command_retries_, MAX_COMMAND_RETRIES);
+        send_pending_command();
+      }
+    } else {
+      ESP_LOGW(TAG, "panel did not adopt the requested state after %u attempts; "
+                    "accepting what it reports", MAX_COMMAND_RETRIES);
+      awaiting_confirmation_ = false;
+      command_retries_       = 0;
+    }
   }
 }
 
@@ -132,6 +175,7 @@ void RcEx3Climate::control(const climate::ClimateCall &call) {
   // the Home Assistant UI stays responsive while that settles.
   this->command_pending_   = true;
   this->command_dirty_ms_  = millis();
+  this->command_retries_   = 0;  // a new request, not a retry of the old one
   this->publish_state();
 }
 
@@ -147,6 +191,26 @@ void RcEx3Climate::send_pending_command() {
            this->desired_temp_wire_, this->desired_temp_wire_ * 0.5f);
 
   send_command(buf, len);
+  this->awaiting_confirmation_ = true;
+  this->command_sent_ms_       = millis();
+}
+
+// Does the panel now report what we asked for? Mode is only meaningful while
+// the unit is on — when it is off the panel reports mode 0 regardless of what
+// was requested, so comparing it there would never confirm.
+bool RcEx3Climate::status_matches_desired(char pwr_c, char mode_c, char fan_c,
+                                          unsigned int raw_temp) const {
+  const uint8_t reported_power = (pwr_c == '1') ? 1 : 0;
+  if (reported_power != this->desired_power_)
+    return false;
+  if (raw_temp != this->desired_temp_wire_)
+    return false;
+  if (static_cast<uint8_t>(fan_c - '0') != this->desired_fan_wire_)
+    return false;
+  if (this->desired_power_ == 1 &&
+      static_cast<uint8_t>(mode_c - '0') != this->desired_mode_wire_)
+    return false;
+  return true;
 }
 
 // ─── Packet dispatch ─────────────────────────────────────────────────────────
@@ -179,8 +243,15 @@ void RcEx3Climate::parse_packet(const char *raw, size_t len) {
 
   ESP_LOGV(TAG, "rx: %s", buf);
 
-  // RSSL1x → climate status; queue op_data only if this update() cycle requested it
+  // RSSL11 is the panel's status reply. RSSL12 is our own poll and RSSL13 our
+  // own command — accepting those as status means any echo on the line is
+  // parsed as state, and an RSSL12 echo decodes to "off, 3.0 °C" because the
+  // short frame puts a literal tag byte where the parser reads temperature.
   if (buf[0] == 'R' && buf[1] == 'S' && buf[2] == 'S' && buf[3] == 'L' && buf[4] == '1') {
+    if (buf[5] != '1') {
+      ESP_LOGD(TAG, "ignoring RSSL1%c (echo of our own frame, not a status reply)", buf[5]);
+      return;
+    }
     parse_status_response(buf, buflen);
     if (op_data_requested_) {
       op_data_requested_ = false;
@@ -192,8 +263,11 @@ void RcEx3Climate::parse_packet(const char *raw, size_t len) {
   // RSR → operational data handshake / response
   if (buf[0] == 'R' && buf[1] == 'S' && buf[2] == 'R') {
     if (buf[3] == '2') {
-      // Unit not yet ready; echo RSR2 immediately and it will eventually respond RSR1
-      send_operational_data_request(true);
+      // Unit not ready yet. Answering straight from the RX handler turns this
+      // into a tight ping-pong: measured at 411 frames in 8.35 s (49/s), which
+      // saturates the bus and the main loop for long enough to threaten the
+      // 10 s API timeout. Hand it to loop(), which paces the retries.
+      op_data_page2_pending_ = true;
     } else if (buf[3] == '1') {
       parse_operational_data(buf, buflen);
     }
@@ -255,18 +329,50 @@ void RcEx3Climate::parse_status_response(const char *buf, size_t len) {
   unsigned int raw_temp = static_cast<unsigned int>(strtol(tmp, nullptr, 16));
   float temp_c = raw_temp * 0.5f;
 
-  bool is_on = (pwr_c == '1');
-  climate::ClimateMode new_mode = is_on ? wire_to_climate_mode(mode_c - '0') : climate::CLIMATE_MODE_OFF;
+  // A checksum only proves the frame arrived intact, not that it is a status
+  // reply we understand. Reject implausible payloads rather than writing them
+  // to the entity, where they surface in Home Assistant as a real state.
+  if (pwr_c != '0' && pwr_c != '1') {
+    ESP_LOGW(TAG, "status rejected: power='%c' is not 0 or 1", pwr_c);
+    return;
+  }
+  if (mode_c < '0' || mode_c > '4') {
+    ESP_LOGW(TAG, "status rejected: mode='%c' outside 0-4", mode_c);
+    return;
+  }
+  if (temp_c < MIN_SETPOINT_C || temp_c > MAX_SETPOINT_C) {
+    ESP_LOGW(TAG, "status rejected: target %.1f°C outside %.0f-%.0f°C",
+             temp_c, MIN_SETPOINT_C, MAX_SETPOINT_C);
+    return;
+  }
 
   ESP_LOGD(TAG, "status: power=%c mode=%c fan=%c temp=%.1f°C", pwr_c, mode_c, fan_c, temp_c);
+
+  // While a request is outstanding, the requested state stays authoritative.
+  // The panel emits status frames that still carry its pre-change values, and
+  // publishing one of those replaces what was just asked for — the revert that
+  // reads as "the setting didn't stick". loop() decides when to stop waiting.
+  if (awaiting_confirmation_) {
+    if (status_matches_desired(pwr_c, mode_c, fan_c, raw_temp)) {
+      awaiting_confirmation_ = false;
+      command_retries_       = 0;
+    } else {
+      ESP_LOGD(TAG, "holding requested state; panel still reports power=%c mode=%c fan=%c temp=%.1f°C",
+               pwr_c, mode_c, fan_c, temp_c);
+      return;
+    }
+  }
+
+  bool is_on = (pwr_c == '1');
+  climate::ClimateMode new_mode = is_on ? wire_to_climate_mode(mode_c - '0') : climate::CLIMATE_MODE_OFF;
 
   this->mode               = new_mode;
   apply_wire_fan_mode(fan_c);
   this->target_temperature = temp_c;
-  if (std::isnan(this->current_temperature) && indoor_temperature_sensor_ &&
-      !std::isnan(indoor_temperature_sensor_->state)) {
+  // Refresh on every status, not only while still NAN — the old guard meant the
+  // first reading would have been frozen in place for the lifetime of the boot.
+  if (indoor_temperature_sensor_ != nullptr && !std::isnan(indoor_temperature_sensor_->state))
     this->current_temperature = indoor_temperature_sensor_->state;
-  }
   this->publish_state();
 }
 
@@ -328,7 +434,9 @@ void RcEx3Climate::parse_operational_data(const char *buf, size_t len) {
   if (compressor_frequency_sensor_)   compressor_frequency_sensor_->publish_state(comp_hz);
   if (indoor_fan_speed_sensor_)       indoor_fan_speed_sensor_->publish_state(in_fan);
 
-  last_op_data_ms_ = millis();
+  last_op_data_ms_       = millis();
+  op_data_retries_       = 0;
+  op_data_page2_pending_ = false;
   this->current_temperature = indoor_air;
   this->publish_state();
 }

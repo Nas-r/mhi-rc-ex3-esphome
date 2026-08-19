@@ -38,7 +38,11 @@ logger:
   # To read these logs remotely, turn on "Subscribe to logs" in the ESPHome
   # integration's options in Home Assistant AND set the log level for
   # homeassistant.components.esphome to debug — both are required.
-  level: DEBUG
+  #
+  # VERBOSE (not DEBUG) because the raw `rx:` frame dump is logged at that
+  # level, and it is the single most useful line when the protocol misbehaves.
+  # The deployed device is already emitting [V] lines, so this matches it.
+  level: VERBOSE
 
 # ── Home Assistant API ───────────────────────────────────────────────────────
 api:
@@ -116,3 +120,36 @@ climate:
     indoor_fan_speed:
       name: "AC Indoor Fan Speed (raw)"
       id: ac_indoor_fan
+
+# ── Health instrumentation ───────────────────────────────────────────────────
+# The entity drops to "unavailable" several times an hour and Home Assistant
+# logs TimeoutAPIError against port 6053. These answer whether the device is
+# rebooting or merely stalling:
+#
+#   Reset Reason  — a reboot leaves a reason here (panic, watchdog, brownout);
+#                   a clean "Power on" after a dropout means it power-cycled.
+#   Uptime        — resets across a dropout → reboot. Keeps climbing → stall.
+#   Loop Time     — the main loop's worst iteration. A spike toward the API's
+#                   10 s timeout points at something blocking the loop.
+#   Heap Free     — rules a slow leak in or out.
+debug:
+  update_interval: 60s
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  - platform: debug
+    free:
+      name: "Heap Free"
+    loop_time:
+      name: "Loop Time"
