@@ -23,6 +23,18 @@ esp32:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+
+  # ESPHome defaults this to "light" on ESP32, which enables WiFi modem sleep:
+  # the radio only wakes at DTIM beacon intervals to collect buffered packets.
+  # Anything the device sends is unaffected — it is awake when it transmits —
+  # so status polls look perfectly healthy while inbound commands from Home
+  # Assistant are delayed by seconds to minutes and are sometimes dropped
+  # outright when the access point discards buffered frames.
+  #
+  # That asymmetry (outbound fine, inbound late and lossy, device otherwise
+  # healthy) is exactly the symptom this device showed. Costs ~20-30 mA.
+  power_save_mode: none
+
   ap:
     ssid: "MHI-RC-EX3 Fallback"
     password: !secret ap_password
