@@ -39,10 +39,11 @@ logger:
   # integration's options in Home Assistant AND set the log level for
   # homeassistant.components.esphome to debug — both are required.
   #
-  # VERBOSE (not DEBUG) because the raw `rx:` frame dump is logged at that
-  # level, and it is the single most useful line when the protocol misbehaves.
-  # The deployed device is already emitting [V] lines, so this matches it.
-  level: VERBOSE
+  # DEBUG keeps the two lines worth having in normal running — `tx →` (INFO)
+  # and `status:` (DEBUG) — while dropping the raw `rx:` frame dump, which is
+  # VERBOSE and fires on every frame. Raise to VERBOSE only while debugging the
+  # protocol: it costs ~14 kB of flash and a formatted serial write per frame.
+  level: DEBUG
 
 # ── Home Assistant API ───────────────────────────────────────────────────────
 api:
@@ -73,8 +74,12 @@ external_components:
   - source:
       type: git
       url: https://github.com/Nas-r/mhi-rc-ex3-esphome.git
-      ref: f8d3644b544b36cf06cb1ac303d3b76688293835
-    refresh: 0s
+      ref: a90d822d623f1a6fa13ccb0842bcc10ee8d99dda
+    # `never` because `ref` is an immutable commit SHA: there is nothing new to
+    # fetch, so re-checking only makes every build depend on GitHub being
+    # reachable. `refresh: 0s` means "re-fetch every build" and is the right
+    # setting only when `ref` is a branch — which it must never be here.
+    refresh: never
     components: [rc_ex3]
 
 # ── UART to RC-EX3 panel ─────────────────────────────────────────────────────
