@@ -121,23 +121,39 @@ void RcEx3Climate::loop() {
     return;
   }
 
-  // The panel normally reports the new state within milliseconds. If it has
-  // not adopted it by the end of the settle window the frame was dropped, so
-  // re-send rather than silently leaving Home Assistant showing a request the
-  // unit never applied.
+  // Ask the panel what it now thinks, rather than waiting for the next
+  // scheduled poll to come round.
+  if (confirm_poll_pending_ && (now - command_sent_ms_) >= CONFIRM_POLL_DELAY_MS &&
+      (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
+    confirm_poll_pending_ = false;
+    confirm_polls_++;
+    send_status_request();
+    return;
+  }
+
+  // Settle window expired. Distinguish "the panel disagrees" from "the panel
+  // has not told us yet" — re-sending a command that was almost certainly
+  // applied just puts more frames on a bus that drops them.
   if (awaiting_confirmation_ && (now - command_sent_ms_) >= COMMAND_SETTLE_MS) {
-    if (command_retries_ < MAX_COMMAND_RETRIES) {
+    if (saw_disagreeing_status_ && command_retries_ < MAX_COMMAND_RETRIES) {
       if ((now - last_tx_ms_) >= MIN_TX_GAP_MS) {
         command_retries_++;
-        ESP_LOGW(TAG, "panel has not adopted the requested state; re-sending (%u/%u)",
+        saw_disagreeing_status_ = false;
+        ESP_LOGW(TAG, "panel reports a different state; re-sending (%u/%u)",
                  command_retries_, MAX_COMMAND_RETRIES);
         send_pending_command();
       }
+    } else if (!saw_disagreeing_status_ && confirm_polls_ < MAX_CONFIRM_POLLS) {
+      // Silence, not disagreement. Ask again before assuming anything.
+      confirm_poll_pending_ = true;
+      command_sent_ms_      = now;
     } else {
-      ESP_LOGW(TAG, "panel did not adopt the requested state after %u attempts; "
-                    "accepting what it reports", MAX_COMMAND_RETRIES);
-      awaiting_confirmation_ = false;
-      command_retries_       = 0;
+      ESP_LOGW(TAG, "gave up confirming the requested state (%u re-sends, %u status polls); "
+                    "accepting what the panel reports", command_retries_, confirm_polls_);
+      awaiting_confirmation_  = false;
+      command_retries_        = 0;
+      confirm_polls_          = 0;
+      saw_disagreeing_status_ = false;
     }
   }
 }
@@ -176,6 +192,7 @@ void RcEx3Climate::control(const climate::ClimateCall &call) {
   this->command_pending_   = true;
   this->command_dirty_ms_  = millis();
   this->command_retries_   = 0;  // a new request, not a retry of the old one
+  this->confirm_polls_     = 0;
   this->publish_state();
 }
 
@@ -191,8 +208,10 @@ void RcEx3Climate::send_pending_command() {
            this->desired_temp_wire_, this->desired_temp_wire_ * 0.5f);
 
   send_command(buf, len);
-  this->awaiting_confirmation_ = true;
-  this->command_sent_ms_       = millis();
+  this->awaiting_confirmation_  = true;
+  this->command_sent_ms_        = millis();
+  this->confirm_poll_pending_   = true;   // actively ask, don't wait for the poll
+  this->saw_disagreeing_status_ = false;
 }
 
 // Does the panel now report what we asked for? Mode is only meaningful while
@@ -271,6 +290,18 @@ void RcEx3Climate::parse_packet(const char *raw, size_t len) {
     } else if (buf[3] == '1') {
       parse_operational_data(buf, buflen);
     }
+    return;
+  }
+
+  // RSSL08 is the panel's acknowledgement of a control frame. It carries no
+  // state, so it cannot confirm anything by itself — but it does mean the
+  // command landed, which is the moment to ask for status rather than sitting
+  // out the rest of the settle window.
+  if (buf[0] == 'R' && buf[1] == 'S' && buf[2] == 'S' && buf[3] == 'L' &&
+      buf[4] == '0' && buf[5] == '8') {
+    ESP_LOGV(TAG, "command acknowledged: %s", buf);
+    if (awaiting_confirmation_)
+      confirm_poll_pending_ = true;
     return;
   }
 
@@ -354,9 +385,12 @@ void RcEx3Climate::parse_status_response(const char *buf, size_t len) {
   // reads as "the setting didn't stick". loop() decides when to stop waiting.
   if (awaiting_confirmation_) {
     if (status_matches_desired(pwr_c, mode_c, fan_c, raw_temp)) {
-      awaiting_confirmation_ = false;
-      command_retries_       = 0;
+      awaiting_confirmation_  = false;
+      command_retries_        = 0;
+      confirm_polls_          = 0;
+      saw_disagreeing_status_ = false;
     } else {
+      saw_disagreeing_status_ = true;
       ESP_LOGD(TAG, "holding requested state; panel still reports power=%c mode=%c fan=%c temp=%.1f°C",
                pwr_c, mode_c, fan_c, temp_c);
       return;

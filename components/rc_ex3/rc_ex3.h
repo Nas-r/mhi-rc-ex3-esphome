@@ -96,9 +96,19 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   uint32_t command_dirty_ms_{0};
   uint32_t last_tx_ms_{0};
 
+  // The panel acknowledges a command with RSSL08 and only reports state in an
+  // RSSL11, which otherwise arrives on the next scheduled poll — up to a full
+  // update_interval away. Waiting for that would expire the settle window on
+  // every command, so a status request is issued to confirm actively.
+  static const uint32_t CONFIRM_POLL_DELAY_MS = 600;
+  static const uint8_t  MAX_CONFIRM_POLLS     = 3;
+
   bool     awaiting_confirmation_{false};
   uint32_t command_sent_ms_{0};
   uint8_t  command_retries_{0};
+  bool     confirm_poll_pending_{false};
+  uint8_t  confirm_polls_{0};
+  bool     saw_disagreeing_status_{false};
 
   // What Home Assistant actually asked for, encoded at control() time. A status
   // response arriving during the debounce window rewrites the entity fields, so
