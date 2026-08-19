@@ -86,31 +86,10 @@ void RcEx3Climate::loop() {
   // Send the op_data request once the status response has been received,
   // separated from the previous frame to avoid overlapping Tx.
   if (op_data_pending_ && (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
-    op_data_pending_         = false;
-    op_data_retries_         = 0;
-    op_data_last_attempt_ms_ = now;
-    op_data_started_ms_      = now;
+    op_data_pending_    = false;
+    op_data_exchanges_  = 0;
+    op_data_started_ms_ = now;
     send_operational_data_request(false);
-    return;
-  }
-
-  // Paced continuation of the RSR2 "not ready" handshake.
-  if (op_data_page2_pending_ && (now - op_data_last_attempt_ms_) >= OP_DATA_RETRY_MS &&
-      (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
-    op_data_page2_pending_ = false;
-    if ((now - op_data_started_ms_) < OP_DATA_HANDSHAKE_MS &&
-        op_data_retries_ < MAX_OP_DATA_RETRIES) {
-      op_data_retries_++;
-      op_data_last_attempt_ms_ = now;
-      send_operational_data_request(true);
-    } else {
-      // Stop asking, and start the interval now so a unit that is never ready
-      // does not get re-asked on every poll for the rest of time.
-      ESP_LOGW(TAG, "unit still not ready for op-data after %u attempts over %u ms; skipping this cycle",
-               op_data_retries_, static_cast<unsigned>(now - op_data_started_ms_));
-      op_data_retries_ = 0;
-      last_op_data_ms_ = now;
-    }
     return;
   }
 
@@ -284,11 +263,21 @@ void RcEx3Climate::parse_packet(const char *raw, size_t len) {
   // RSR → operational data handshake / response
   if (buf[0] == 'R' && buf[1] == 'S' && buf[2] == 'R') {
     if (buf[3] == '2') {
-      // Unit not ready yet. Answering straight from the RX handler turns this
-      // into a tight ping-pong: measured at 411 frames in 8.35 s (49/s), which
-      // saturates the bus and the main loop for long enough to threaten the
-      // 10 s API timeout. Hand it to loop(), which paces the retries.
-      op_data_page2_pending_ = true;
+      // Not ready. This has to be answered immediately: throttling it to one
+      // exchange per 500 ms left the unit not-ready through 39 asks over 20 s,
+      // where 411 back-to-back exchanges completed in 8.35 s. Bounded by both
+      // count and wall time so it cannot run away as it previously did.
+      const uint32_t now = millis();
+      if (op_data_exchanges_ < MAX_OP_DATA_EXCHANGES &&
+          (now - op_data_started_ms_) < OP_DATA_HANDSHAKE_MS) {
+        op_data_exchanges_++;
+        send_operational_data_request(true);
+      } else if (op_data_exchanges_ != 0) {
+        ESP_LOGW(TAG, "unit still not ready for op-data after %u exchanges over %u ms; skipping this cycle",
+                 op_data_exchanges_, static_cast<unsigned>(now - op_data_started_ms_));
+        op_data_exchanges_ = 0;
+        last_op_data_ms_   = now;  // don't re-ask on every poll
+      }
     } else if (buf[3] == '1') {
       parse_operational_data(buf, buflen);
     }
@@ -470,9 +459,10 @@ void RcEx3Climate::parse_operational_data(const char *buf, size_t len) {
   if (compressor_frequency_sensor_)   compressor_frequency_sensor_->publish_state(comp_hz);
   if (indoor_fan_speed_sensor_)       indoor_fan_speed_sensor_->publish_state(in_fan);
 
-  last_op_data_ms_       = millis();
-  op_data_retries_       = 0;
-  op_data_page2_pending_ = false;
+  ESP_LOGD(TAG, "op-data ready after %u exchanges in %u ms",
+           op_data_exchanges_, static_cast<unsigned>(millis() - op_data_started_ms_));
+  last_op_data_ms_   = millis();
+  op_data_exchanges_ = 0;
   this->current_temperature = indoor_air;
   this->publish_state();
 }
