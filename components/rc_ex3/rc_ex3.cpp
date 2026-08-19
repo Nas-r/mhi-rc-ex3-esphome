@@ -80,11 +80,22 @@ void RcEx3Climate::loop() {
     }
   }
 
+  const uint32_t now = millis();
+
   // Send the op_data request once the status response has been received,
-  // separated by one loop tick to avoid overlapping Tx.
-  if (op_data_pending_) {
+  // separated from the previous frame to avoid overlapping Tx.
+  if (op_data_pending_ && (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
     op_data_pending_ = false;
     send_operational_data_request(false);
+    return;
+  }
+
+  // One coalesced control frame, sent only once Home Assistant has stopped
+  // calling and the bus has been quiet long enough for the panel to keep up.
+  if (command_pending_ && (now - command_dirty_ms_) >= COMMAND_DEBOUNCE_MS &&
+      (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
+    command_pending_ = false;
+    send_pending_command();
   }
 }
 
@@ -95,37 +106,47 @@ void RcEx3Climate::control(const climate::ClimateCall &call) {
     this->mode = *call.get_mode();
   if (call.get_target_temperature().has_value())
     this->target_temperature = *call.get_target_temperature();
-  if (call.get_fan_mode().has_value())
-    this->fan_mode = *call.get_fan_mode();
 
-  uint8_t power    = (this->mode == climate::CLIMATE_MODE_OFF) ? 0 : 1;
-  uint8_t mode     = climate_mode_to_wire(this->mode);
-  uint8_t fan = 0x07;
+  // A call carries either a built-in fan mode or a custom one. The setters
+  // below each clear the other, so the two can never disagree and selecting
+  // Auto can always get back out of a custom speed.
   auto custom_fan_mode = call.get_custom_fan_mode();
-  if (!custom_fan_mode.empty())
-    this->requested_custom_fan_mode_ = custom_fan_mode.c_str();
-
-  if (!this->requested_custom_fan_mode_.empty()) {
-    if (this->requested_custom_fan_mode_ == "1") fan = 0x00;
-    else if (this->requested_custom_fan_mode_ == "2") fan = 0x01;
-    else if (this->requested_custom_fan_mode_ == "3") fan = 0x02;
-    else if (this->requested_custom_fan_mode_ == "4") fan = 0x06;
-    this->fan_mode = climate::CLIMATE_FAN_ON;
-  } else {
-    this->fan_mode = climate::CLIMATE_FAN_AUTO;
+  if (!custom_fan_mode.empty()) {
+    this->requested_custom_fan_mode_.assign(custom_fan_mode.c_str(), custom_fan_mode.size());
+    this->set_custom_fan_mode_(custom_fan_mode);
+  } else if (call.get_fan_mode().has_value()) {
+    this->requested_custom_fan_mode_.clear();
+    this->set_fan_mode_(*call.get_fan_mode());
   }
-  uint8_t temp_wire = static_cast<uint8_t>(this->target_temperature * 2.0f);
 
+  // Encode the request now rather than at send time. A status response arriving
+  // during the debounce window rewrites the entity fields, and rebuilding the
+  // frame from those would transmit the panel's own value straight back.
+  this->desired_power_     = (this->mode == climate::CLIMATE_MODE_OFF) ? 0 : 1;
+  this->desired_mode_wire_ = climate_mode_to_wire(this->mode);
+  this->desired_fan_wire_  = custom_fan_mode_to_wire(this->requested_custom_fan_mode_);
+  this->desired_temp_wire_ = static_cast<uint8_t>(this->target_temperature * 2.0f);
+
+  // Don't transmit yet — mark the state dirty and let loop() send one frame
+  // carrying every field once the calls stop arriving. Publish immediately so
+  // the Home Assistant UI stays responsive while that settles.
+  this->command_pending_   = true;
+  this->command_dirty_ms_  = millis();
+  this->publish_state();
+}
+
+void RcEx3Climate::send_pending_command() {
   char buf[64];
   size_t len = snprintf(buf, sizeof(buf),
     "RSSL13FF0001%.2x02%.2x03%.2x04FF0503%.2x06FF0FFF43FF",
-    power, mode, fan, temp_wire);
+    this->desired_power_, this->desired_mode_wire_,
+    this->desired_fan_wire_, this->desired_temp_wire_);
 
   ESP_LOGI(TAG, "tx → power=%d mode=%d fan=0x%02x temp_wire=%d (%.1f°C)",
-           power, mode, fan, temp_wire, this->target_temperature);
+           this->desired_power_, this->desired_mode_wire_, this->desired_fan_wire_,
+           this->desired_temp_wire_, this->desired_temp_wire_ * 0.5f);
 
   send_command(buf, len);
-  this->publish_state();
 }
 
 // ─── Packet dispatch ─────────────────────────────────────────────────────────
@@ -240,20 +261,36 @@ void RcEx3Climate::parse_status_response(const char *buf, size_t len) {
   ESP_LOGD(TAG, "status: power=%c mode=%c fan=%c temp=%.1f°C", pwr_c, mode_c, fan_c, temp_c);
 
   this->mode               = new_mode;
-  this->fan_mode = wire_to_fan_mode(fan_c);
-  switch (fan_c) {
-    case '0': this->requested_custom_fan_mode_ = "1"; break;
-    case '1': this->requested_custom_fan_mode_ = "2"; break;
-    case '2': this->requested_custom_fan_mode_ = "3"; break;
-    case '6': this->requested_custom_fan_mode_ = "4"; break;
-    default: this->requested_custom_fan_mode_.clear(); break;
-  }
+  apply_wire_fan_mode(fan_c);
   this->target_temperature = temp_c;
   if (std::isnan(this->current_temperature) && indoor_temperature_sensor_ &&
       !std::isnan(indoor_temperature_sensor_->state)) {
     this->current_temperature = indoor_temperature_sensor_->state;
   }
   this->publish_state();
+}
+
+// Map a wire fan-speed character onto the entity. Speeds 1–4 are exposed as
+// custom fan modes, so they have to be published through set_custom_fan_mode_()
+// — fan_mode only ever carries the built-in Auto. Publishing a fan_mode that
+// traits() doesn't advertise leaves Home Assistant showing a stale selection.
+void RcEx3Climate::apply_wire_fan_mode(char wire_c) {
+  const char *custom = nullptr;
+  switch (wire_c) {
+    case '0': custom = "1"; break;
+    case '1': custom = "2"; break;
+    case '2': custom = "3"; break;
+    case '6': custom = "4"; break;
+    default: break;  // '7' and anything unrecognised → Auto
+  }
+
+  if (custom != nullptr) {
+    this->requested_custom_fan_mode_ = custom;
+    this->set_custom_fan_mode_(custom);
+  } else {
+    this->requested_custom_fan_mode_.clear();
+    this->set_fan_mode_(climate::CLIMATE_FAN_AUTO);
+  }
 }
 
 // ─── Operational data parser ──────────────────────────────────────────────────
@@ -316,6 +353,7 @@ void RcEx3Climate::send_command(const char *payload, size_t len) {
   this->write_byte(static_cast<uint8_t>(hex_sum[0]));
   this->write_byte(static_cast<uint8_t>(hex_sum[1]));
   this->write_byte(0x03);
+  last_tx_ms_ = millis();
 }
 
 void RcEx3Climate::send_status_request() {
@@ -324,6 +362,7 @@ void RcEx3Climate::send_status_request() {
   for (const char *p = query; *p; p++)
     this->write_byte(static_cast<uint8_t>(*p));
   this->write_byte(0x03);
+  last_tx_ms_ = millis();
 }
 
 void RcEx3Climate::send_operational_data_request(bool second_page) {
@@ -332,6 +371,7 @@ void RcEx3Climate::send_operational_data_request(bool second_page) {
   for (const char *p = query; *p; p++)
     this->write_byte(static_cast<uint8_t>(*p));
   this->write_byte(0x03);
+  last_tx_ms_ = millis();
 }
 
 // ─── Encoding helpers ─────────────────────────────────────────────────────────
@@ -362,8 +402,12 @@ uint8_t RcEx3Climate::fan_mode_to_wire(climate::ClimateFanMode) {
   return 0x07;
 }
 
-climate::ClimateFanMode RcEx3Climate::wire_to_fan_mode(char c) {
-  return (c == '7') ? climate::CLIMATE_FAN_AUTO : climate::CLIMATE_FAN_ON;
+uint8_t RcEx3Climate::custom_fan_mode_to_wire(const std::string &mode) {
+  if (mode == "1") return 0x00;
+  if (mode == "2") return 0x01;
+  if (mode == "3") return 0x02;
+  if (mode == "4") return 0x06;
+  return 0x07;  // empty or unrecognised → Auto
 }
 
 size_t RcEx3Climate::hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {

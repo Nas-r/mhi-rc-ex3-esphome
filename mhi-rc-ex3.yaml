@@ -4,8 +4,8 @@
 # Hardware wiring (4 wires into the RC-EX3 panel through-hole vias):
 #   Panel VCC  → ESP32 3.3 V (use a 3.3 V buck converter, NOT a linear reg)
 #   Panel GND  → ESP32 GND
-#   Panel TX   → ESP32 GPIO16  (UART2 RX)
-#   Panel RX   → ESP32 GPIO17  (UART2 TX)
+#   Panel TX   → ESP32 GPIO11  (UART RX)
+#   Panel RX   → ESP32 GPIO4   (UART TX)
 #
 # Serial parameters: 38400 baud, 8 data bits, Even parity, 1 stop bit (8E1)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,8 +31,13 @@ captive_portal:
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logger:
-  # UART0 is the default logger port; RC-EX3 uses UART2 (GPIO16/17) so there
-  # is no conflict. Set level to DEBUG while commissioning, then WARN in prod.
+  # Logging goes out over USB CDC on the S2, so it does not contend with the
+  # RC-EX3 UART on GPIO11/GPIO4. Set level to DEBUG while commissioning, then
+  # WARN in prod.
+  #
+  # To read these logs remotely, turn on "Subscribe to logs" in the ESPHome
+  # integration's options in Home Assistant AND set the log level for
+  # homeassistant.components.esphome to debug — both are required.
   level: DEBUG
 
 # ── Home Assistant API ───────────────────────────────────────────────────────
@@ -62,8 +67,8 @@ external_components:
 # ── UART to RC-EX3 panel ─────────────────────────────────────────────────────
 uart:
   id: rc_ex3_uart
-  rx_pin: GPIO16
-  tx_pin: GPIO17
+  rx_pin: GPIO11
+  tx_pin: GPIO4
   baud_rate: 38400
   parity: EVEN
   stop_bits: 1
@@ -74,8 +79,13 @@ climate:
   - platform: rc_ex3
     name: "Living Room AC"
     uart_id: rc_ex3_uart
-    update_interval: 5min   # status poll cadence
-    op_data_interval: 5    # 0 = disable diagnostic sensor requests (prevents "communicating with PC" mode)
+    update_interval: 30sec   # status poll cadence
+    # Minutes between diagnostic-data requests; 0 disables them (which also
+    # prevents the panel's "communicating with PC" mode). NOTE: this is the one
+    # value below not confirmed against the deployed config — no request fired
+    # during 15 min of observation, which rules out a small value but fits
+    # either 100 or 0. Correct it if the running config says 0.
+    op_data_interval: 100
 
     # ── Diagnostic sensors (all optional – remove any you don't need) ─────────
     indoor_temperature:

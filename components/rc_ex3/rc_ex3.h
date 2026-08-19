@@ -46,17 +46,20 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   void send_command(const char *payload, size_t len);
   void send_status_request();
   void send_operational_data_request(bool second_page = false);
+  void send_pending_command();
 
   void parse_packet(const char *raw, size_t len);
   bool validate_checksum_and_extract_payload_(const char *raw, size_t len, char *payload, size_t payload_size, size_t &payload_len);
   void parse_status_response(const char *buf, size_t len);
   void parse_operational_data(const char *buf, size_t len);
 
+  void apply_wire_fan_mode(char wire_c);
+
   uint8_t calc_checksum(const char *data, size_t len);
   size_t  hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 
   static uint8_t              fan_mode_to_wire(climate::ClimateFanMode mode);
-  static climate::ClimateFanMode wire_to_fan_mode(char c);
+  static uint8_t              custom_fan_mode_to_wire(const std::string &mode);
   static uint8_t              climate_mode_to_wire(climate::ClimateMode mode);
   static climate::ClimateMode wire_to_climate_mode(uint8_t wire_val);
 
@@ -64,6 +67,27 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   char    rx_buf_[RX_BUF_SIZE];
   size_t  rx_len_{0};
   RxState rx_state_{RxState::WAITING_FOR_SOF};
+
+  // Home Assistant sends one control call per field, and dragging the
+  // temperature slider sends one per step. The panel silently drops frames
+  // that arrive faster than it can process them, so calls are coalesced into
+  // a single frame once they stop arriving, and no two frames are ever sent
+  // closer together than MIN_TX_GAP_MS.
+  static const uint32_t COMMAND_DEBOUNCE_MS = 400;
+  static const uint32_t MIN_TX_GAP_MS       = 150;
+
+  bool     command_pending_{false};
+  uint32_t command_dirty_ms_{0};
+  uint32_t last_tx_ms_{0};
+
+  // What Home Assistant actually asked for, encoded at control() time. A status
+  // response arriving during the debounce window rewrites the entity fields, so
+  // rebuilding the frame from those at send time would transmit the panel's own
+  // value back and silently discard the change.
+  uint8_t desired_power_{0};
+  uint8_t desired_mode_wire_{0};
+  uint8_t desired_fan_wire_{0x07};
+  uint8_t desired_temp_wire_{44};
 
   uint32_t op_data_interval_minutes_{0};
   uint32_t last_op_data_ms_{0};

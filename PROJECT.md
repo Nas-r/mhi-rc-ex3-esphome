@@ -128,6 +128,12 @@ This avoids sending both requests simultaneously and overlapping their responses
 
 When Home Assistant sends a control action, all four parameters (power, mode, fan, temperature) are packed into a single `RSSL13...` packet rather than sending individual field-update packets. This matches the upstream `setClimate()` approach and ensures the unit always receives a coherent state.
 
+### Debounced, Paced Transmission
+
+Home Assistant issues one `control()` call per field, and dragging the temperature slider issues one per step. Transmitting a frame for each of them overruns the panel, which silently drops frames it cannot keep up with — measured on real hardware, eight frames sent 22 ms apart resulted in only three being applied, and the requested setpoint was lost.
+
+So `control()` does not transmit. It updates entity state, publishes optimistically so the UI stays responsive, and marks the state dirty. `loop()` sends a single combined frame once `COMMAND_DEBOUNCE_MS` (400 ms) has passed with no further calls. Every transmitter records `last_tx_ms_`, and no frame is sent within `MIN_TX_GAP_MS` (150 ms) of the previous one, so a coalesced command cannot collide with a status poll or an op-data request.
+
 ### Fan Speed Mapping
 
 The protocol has 4 discrete speeds plus auto. ESPHome's built-in `ClimateFanMode` only covers Auto/Low/Medium/High, so speeds 1–4 are exposed as ESPHome *custom fan modes* (`"1"`–`"4"`). Auto remains a standard built-in mode.
@@ -141,6 +147,8 @@ The protocol has 4 discrete speeds plus auto. ESPHome's built-in `ClimateFanMode
 | "4" (custom)      | 0x06      | Speed 4        |
 
 On receive, `apply_wire_fan_mode()` maps wire chars `'0'`–`'2'`/`'6'` to custom modes and clears `fan_mode`, or sets `CLIMATE_FAN_AUTO` and clears `custom_fan_mode` for any other value.
+
+Speeds 1–4 **must** be published through `Climate::set_custom_fan_mode_()`, not by assigning `fan_mode`. The custom mode is what Home Assistant reads for these speeds; `fan_mode` only ever carries the built-in Auto. Publishing `CLIMATE_FAN_ON` — which `traits()` does not advertise as supported — leaves the Home Assistant fan selector showing a stale value, so a fan change appears never to take effect even though the panel applied it. `set_custom_fan_mode_()` and `set_fan_mode_()` each clear the other, which is also what lets a switch back to Auto actually stick.
 
 ### Diagnostic Sensors
 
