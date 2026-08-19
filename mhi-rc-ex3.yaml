@@ -73,7 +73,7 @@ external_components:
   - source:
       type: git
       url: https://github.com/Nas-r/mhi-rc-ex3-esphome.git
-      ref: 0f99a084059afd092d34d05e50be5db01b5b375a
+      ref: 0fb651bd93af2579f1d966c7eeb06a0dfc6fe0e1
     refresh: 0s
     components: [rc_ex3]
 
