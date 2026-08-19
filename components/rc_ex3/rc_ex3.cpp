@@ -89,6 +89,7 @@ void RcEx3Climate::loop() {
     op_data_pending_         = false;
     op_data_retries_         = 0;
     op_data_last_attempt_ms_ = now;
+    op_data_started_ms_      = now;
     send_operational_data_request(false);
     return;
   }
@@ -97,15 +98,16 @@ void RcEx3Climate::loop() {
   if (op_data_page2_pending_ && (now - op_data_last_attempt_ms_) >= OP_DATA_RETRY_MS &&
       (now - last_tx_ms_) >= MIN_TX_GAP_MS) {
     op_data_page2_pending_ = false;
-    if (op_data_retries_ < MAX_OP_DATA_RETRIES) {
+    if ((now - op_data_started_ms_) < OP_DATA_HANDSHAKE_MS &&
+        op_data_retries_ < MAX_OP_DATA_RETRIES) {
       op_data_retries_++;
       op_data_last_attempt_ms_ = now;
       send_operational_data_request(true);
     } else {
       // Stop asking, and start the interval now so a unit that is never ready
       // does not get re-asked on every poll for the rest of time.
-      ESP_LOGW(TAG, "unit still not ready for op-data after %u attempts; skipping this cycle",
-               MAX_OP_DATA_RETRIES);
+      ESP_LOGW(TAG, "unit still not ready for op-data after %u attempts over %u ms; skipping this cycle",
+               op_data_retries_, static_cast<unsigned>(now - op_data_started_ms_));
       op_data_retries_ = 0;
       last_op_data_ms_ = now;
     }

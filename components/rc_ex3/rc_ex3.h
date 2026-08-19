@@ -123,11 +123,18 @@ class RcEx3Climate : public climate::Climate, public uart::UARTDevice, public Po
   // willing to send the blob. Upstream sleeps 500 ms between attempts; this
   // component paces them from loop() instead, and gives up after a bounded
   // number so a sulking unit cannot occupy the bus indefinitely.
-  static const uint32_t OP_DATA_RETRY_MS    = 500;
-  static const uint8_t  MAX_OP_DATA_RETRIES = 10;
+  // Bound the handshake by wall time, not attempts: the unit stays "not ready"
+  // for a fixed preparation period rather than a fixed number of asks. Measured
+  // at ~8.3 s on this panel, so 20 s leaves headroom without letting a sulking
+  // unit occupy the bus indefinitely. MAX_OP_DATA_RETRIES is only a backstop
+  // against a pathological loop.
+  static const uint32_t OP_DATA_RETRY_MS     = 500;
+  static const uint32_t OP_DATA_HANDSHAKE_MS = 20000;
+  static const uint8_t  MAX_OP_DATA_RETRIES  = 60;
 
   bool     op_data_page2_pending_{false};
   uint32_t op_data_last_attempt_ms_{0};
+  uint32_t op_data_started_ms_{0};
   uint8_t  op_data_retries_{0};
 
   uint32_t op_data_interval_minutes_{0};
